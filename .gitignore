@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.wav
+*.png
+*.mp3
+*.flac
+.claude/
+nul
