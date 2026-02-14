@@ -2,3 +2,5 @@
 タスクは超細分化しPDCAサイクルを構築すること。
 バグ修正においては複数回の試行でうまく修正できない場合今までの常識を忘れ再調査をsubagentやtask agentに委託しなさい。
 常に日本語で私に応答すること。他の検索や思考は英語で構わない。
+コミットメッセージは日本語で
+テスト音源は..\..\audio\music\spotify\spotifydown.com - おもかげ (produced by Vaundy).mp3です。

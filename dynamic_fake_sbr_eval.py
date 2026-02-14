@@ -46,104 +46,125 @@ SILENCE_THRESHOLD_HZ = 1000
 # --- 自動ゲイン算出用パラメータ ---
 GAIN_SMOOTH_WINDOW = 120
 GAIN_CALC_LOW_CUT_HZ = 2000
-MAX_GAIN_LIMIT_DB = 0.0        
+MAX_GAIN_LIMIT_DB = 6.0
 
-# 感度設定 (Dual Shelf)
-SENSITIVITY_MID = 0.2
-SENSITIVITY_HIGH = 0.25
+# ★マルチバンドAGCパラメータ
+AGC_N_BANDS = 3
+AGC_GAIN_SMOOTH_ALPHA = 0.3      # ゲイン平滑化係数 (0=変化なし, 1=即追従)
+AGC_MAX_GAIN_DB = 6.0             # 最大ブースト
+AGC_MIN_GAIN_DB = -20.0           # 最大カット
+AGC_REFERENCE_BAND_RATIO = 0.7    # カットオフ直下の参照バンド幅比率
+
+# ★ S&Hオーバーサンプリング係数 (2.0→2.5: ナイキストヌルを臨界帯域外にシフト)
+SH_OVERSAMPLE_FACTOR = 2.5
 
 # ==========================================
 # ★ Numbaによる高速化されたサンプル単位処理
 # ==========================================
 
 @jit(nopython=True)
-def apply_dynamic_processing(audio, cutoffs_per_sample, tilts_db_per_sample, sr):
+def apply_sample_hold(audio, cutoffs_per_sample, sr):
+    """S&Hのみ実行。スペクトル整形はマルチバンドAGCが担当。"""
     n_samples = len(audio)
-    output = np.zeros_like(audio)
     sh_output = np.zeros_like(audio)
-    
     hold_val = 0.0
     phase_accumulator = 0.0
-    
-    z1_m = 0.0; z2_m = 0.0
-    z1_h = 0.0; z2_h = 0.0
-    
-    pi = 3.141592653589793
-    
     for i in range(n_samples):
         fc = cutoffs_per_sample[i]
-        tilt_db = tilts_db_per_sample[i]
-        
         if fc < 100.0: fc = 100.0
         if fc > sr / 2.0 - 100.0: fc = sr / 2.0 - 100.0
-        
-        # A. Variable Sample & Hold
-        target_sr = fc * 2.0
+        target_sr = fc * SH_OVERSAMPLE_FACTOR
         phase_step = target_sr / sr
         phase_accumulator += phase_step
-        
         if phase_accumulator >= 1.0:
             hold_val = audio[i]
             phase_accumulator -= 1.0
-        
-        exciter_sig = hold_val
-        sh_output[i] = exciter_sig
-        
-        if tilt_db < -60.0:
-            output[i] = audio[i]
-            z1_m *= 0.99; z2_m *= 0.99
-            z1_h *= 0.99; z2_h *= 0.99
+        sh_output[i] = hold_val
+    return sh_output
+
+def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts_per_frame):
+    """STFT領域マルチバンドAGC: S&H出力を回帰予測ターゲットに合わせてゲイン制御"""
+    n_fft = 2048
+    hop = 512
+
+    S_sh = librosa.stft(sh_signal, n_fft=n_fft, hop_length=hop)
+    S_deg = librosa.stft(degraded_signal, n_fft=n_fft, hop_length=hop)
+
+    mag_sh = np.abs(S_sh)
+    phase_sh = np.angle(S_sh)
+    mag_deg = np.abs(S_deg)
+
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    n_frames = mag_sh.shape[1]
+    n_bins = mag_sh.shape[0]
+
+    eps = 1e-10
+    log10_2000 = np.log10(GAIN_CALC_LOW_CUT_HZ)
+
+    # バンド境界（カットオフ〜ナイキスト間を3等分）
+    mag_out = mag_sh.copy()
+    prev_gains = np.zeros(AGC_N_BANDS)
+
+    for frame_idx in range(n_frames):
+        fc = cutoffs_per_frame[min(frame_idx, len(cutoffs_per_frame)-1)]
+        tilt = tilts_per_frame[min(frame_idx, len(tilts_per_frame)-1)]
+
+        if fc < 200.0:
             continue
 
-        # B. Dual Dynamic High Shelf Filter
-        # 1. Mid Shelf
-        mid_gain = tilt_db * SENSITIVITY_MID
-        A_m = 10.0 ** (mid_gain / 40.0)
-        w0_m = 2.0 * pi * fc / sr
-        cos_w0_m = np.cos(w0_m)
-        sin_w0_m = np.sin(w0_m)
-        alpha_m = sin_w0_m / (2.0 * 0.707)
-        sqA_m = np.sqrt(A_m)
-        
-        a0_m = (A_m+1) - (A_m-1)*cos_w0_m + 2*sqA_m*alpha_m
-        b0_m = A_m * ((A_m+1) + (A_m-1)*cos_w0_m + 2*sqA_m*alpha_m)
-        b1_m = -2 * A_m * ((A_m-1) + (A_m+1)*cos_w0_m)
-        b2_m = A_m * ((A_m+1) + (A_m-1)*cos_w0_m - 2*sqA_m*alpha_m)
-        a1_m = 2 * ((A_m-1) - (A_m+1)*cos_w0_m)
-        a2_m = (A_m+1) - (A_m-1)*cos_w0_m - 2*sqA_m*alpha_m
-        b0_m /= a0_m; b1_m /= a0_m; b2_m /= a0_m; a1_m /= a0_m; a2_m /= a0_m
-        
-        mid_out = b0_m * exciter_sig + z1_m
-        z1_m = b1_m * exciter_sig - a1_m * mid_out + z2_m
-        z2_m = b2_m * exciter_sig - a2_m * mid_out
-        
-        # 2. High Shelf
-        high_gain = tilt_db * SENSITIVITY_HIGH
-        high_fc = fc * 2.0
-        if high_fc > sr / 2.0 - 100.0: high_fc = sr / 2.0 - 100.0
-        
-        A_h = 10.0 ** (high_gain / 40.0)
-        w0_h = 2.0 * pi * high_fc / sr
-        cos_w0_h = np.cos(w0_h)
-        sin_w0_h = np.sin(w0_h)
-        alpha_h = sin_w0_h / (2.0 * 0.707)
-        sqA_h = np.sqrt(A_h)
-        
-        a0_h = (A_h+1) - (A_h-1)*cos_w0_h + 2*sqA_h*alpha_h
-        b0_h = A_h * ((A_h+1) + (A_h-1)*cos_w0_h + 2*sqA_h*alpha_h)
-        b1_h = -2 * A_h * ((A_h-1) + (A_h+1)*cos_w0_h)
-        b2_h = A_h * ((A_h+1) + (A_h-1)*cos_w0_h - 2*sqA_h*alpha_h)
-        a1_h = 2 * ((A_h-1) - (A_h+1)*cos_w0_h)
-        a2_h = (A_h+1) - (A_h-1)*cos_w0_h - 2*sqA_h*alpha_h
-        b0_h /= a0_h; b1_h /= a0_h; b2_h /= a0_h; a1_h /= a0_h; a2_h /= a0_h
-        
-        final_out = b0_h * mid_out + z1_h
-        z1_h = b1_h * mid_out - a1_h * final_out + z2_h
-        z2_h = b2_h * mid_out - a2_h * final_out
-        
-        output[i] = final_out
+        nyquist = sr / 2.0
+        log10_fc = np.log10(max(fc, 200.0))
+        denom = log10_fc - log10_2000
+        slope = tilt / denom if abs(denom) > 0.01 else 0.0
 
-    return output, sh_output
+        # 参照レベル: カットオフ直下のパスバンドエネルギー
+        ref_low_idx = np.searchsorted(freqs, fc * AGC_REFERENCE_BAND_RATIO)
+        ref_high_idx = np.searchsorted(freqs, fc)
+        if ref_high_idx <= ref_low_idx:
+            continue
+        ref_mag_db = np.mean(20.0 * np.log10(mag_deg[ref_low_idx:ref_high_idx, frame_idx] + eps))
+
+        # S&Hのカットオフ以上のビンインデックス
+        cutoff_bin = np.searchsorted(freqs, fc)
+        band_range = n_bins - cutoff_bin
+        if band_range < 3:
+            continue
+        band_size = band_range // AGC_N_BANDS
+
+        for b in range(AGC_N_BANDS):
+            b_start = cutoff_bin + b * band_size
+            b_end = cutoff_bin + (b + 1) * band_size if b < AGC_N_BANDS - 1 else n_bins
+            if b_start >= b_end:
+                continue
+
+            # バンド中心周波数
+            band_center_idx = (b_start + b_end) // 2
+            f_center = freqs[min(band_center_idx, len(freqs)-1)]
+            if f_center <= 0:
+                continue
+
+            # ターゲットレベル = 参照レベル + 回帰外挿
+            target_db = ref_mag_db + slope * (np.log10(f_center) - log10_fc)
+
+            # 実測レベル
+            actual_db = np.mean(20.0 * np.log10(mag_sh[b_start:b_end, frame_idx] + eps))
+
+            # ゲイン計算
+            gain_db = target_db - actual_db
+            gain_db = np.clip(gain_db, AGC_MIN_GAIN_DB, AGC_MAX_GAIN_DB)
+
+            # 時間平滑化
+            gain_db = prev_gains[b] * (1.0 - AGC_GAIN_SMOOTH_ALPHA) + gain_db * AGC_GAIN_SMOOTH_ALPHA
+            prev_gains[b] = gain_db
+
+            # リニアゲイン適用
+            gain_linear = 10.0 ** (gain_db / 20.0)
+            mag_out[b_start:b_end, frame_idx] *= gain_linear
+
+    # 位相を保持してISTFT
+    S_out = mag_out * np.exp(1j * phase_sh)
+    enhanced = librosa.istft(S_out, hop_length=hop, length=len(sh_signal))
+    return enhanced
 
 # ==========================================
 # 評価用劣化フィルタ
@@ -159,6 +180,76 @@ def apply_lowpass_filter(y, sr, cutoff_freq, order=8):
         for ch in range(y.shape[1]):
             y_filtered[:, ch] = sosfilt(sos, y[:, ch])
     return y_filtered
+
+# ==========================================
+# 評価メトリクス
+# ==========================================
+
+def apply_bandpass_filter(y, sr, low_freq, high_freq, order=4):
+    nyquist = 0.5 * sr
+    if low_freq <= 0:
+        norm_high = min(high_freq / nyquist, 0.99)
+        sos = butter(order, norm_high, btype='low', analog=False, output='sos')
+    elif high_freq >= nyquist:
+        norm_low = max(low_freq / nyquist, 0.01)
+        sos = butter(order, norm_low, btype='high', analog=False, output='sos')
+    else:
+        norm_low = max(low_freq / nyquist, 0.01)
+        norm_high = min(high_freq / nyquist, 0.99)
+        sos = butter(order, [norm_low, norm_high], btype='band', analog=False, output='sos')
+    if y.ndim == 1:
+        return sosfilt(sos, y)
+    else:
+        y_filtered = np.zeros_like(y)
+        for ch in range(y.shape[1]):
+            y_filtered[:, ch] = sosfilt(sos, y[:, ch])
+        return y_filtered
+
+def compute_band_mse(original, enhanced, sr, cutoff_freq):
+    orig_mono = original[:, 0] if original.ndim > 1 else original
+    enh_mono = enhanced[:, 0] if enhanced.ndim > 1 else enhanced
+    orig_a = apply_bandpass_filter(orig_mono, sr, 0, cutoff_freq)
+    enh_a = apply_bandpass_filter(enh_mono, sr, 0, cutoff_freq)
+    mse_a = np.mean((orig_a - enh_a) ** 2)
+    orig_b = apply_bandpass_filter(orig_mono, sr, cutoff_freq, 20000)
+    enh_b = apply_bandpass_filter(enh_mono, sr, cutoff_freq, 20000)
+    mse_b = np.mean((orig_b - enh_b) ** 2)
+    orig_c = apply_bandpass_filter(orig_mono, sr, 20000, sr / 2)
+    enh_c = apply_bandpass_filter(enh_mono, sr, 20000, sr / 2)
+    mse_c = np.mean((orig_c - enh_c) ** 2)
+    return {
+        'band_a_mse': mse_a,
+        'band_b_mse': mse_b,
+        'band_c_mse': mse_c,
+        'full_mse': np.mean((orig_mono - enh_mono) ** 2)
+    }
+
+def compute_band_lsd(original, enhanced, sr, cutoff_freq, n_fft=2048):
+    orig_mono = original[:, 0] if original.ndim > 1 else original
+    enh_mono = enhanced[:, 0] if enhanced.ndim > 1 else enhanced
+    S_orig = np.abs(librosa.stft(orig_mono, n_fft=n_fft))
+    S_enh = np.abs(librosa.stft(enh_mono, n_fft=n_fft))
+    eps = 1e-10
+    log_orig = 20.0 * np.log10(S_orig + eps)
+    log_enh = 20.0 * np.log10(S_enh + eps)
+    diff_sq = (log_orig - log_enh) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    idx_cutoff = np.searchsorted(freqs, cutoff_freq)
+    idx_20k = np.searchsorted(freqs, 20000)
+    lsd_a = np.sqrt(np.mean(diff_sq[:idx_cutoff, :])) if idx_cutoff > 0 else 0.0
+    lsd_b = np.sqrt(np.mean(diff_sq[idx_cutoff:idx_20k, :])) if idx_20k > idx_cutoff else 0.0
+    lsd_c = np.sqrt(np.mean(diff_sq[idx_20k:, :])) if len(freqs) > idx_20k else 0.0
+    return {
+        'lsd_full': np.sqrt(np.mean(diff_sq)),
+        'lsd_band_a': lsd_a,
+        'lsd_band_b': lsd_b,
+        'lsd_band_c': lsd_c
+    }
+
+def compute_all_metrics(original, enhanced, sr, cutoff_freq):
+    mse_metrics = compute_band_mse(original, enhanced, sr, cutoff_freq)
+    lsd_metrics = compute_band_lsd(original, enhanced, sr, cutoff_freq)
+    return {**mse_metrics, **lsd_metrics}
 
 # ==========================================
 # 解析ロジック
@@ -320,7 +411,7 @@ def save_individual_plot(fig, base_filename, suffix):
     print(f"Plot saved: {out_img_name}")
     plt.close(fig)
 
-def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, cutoffs, tilts, eval_cutoff, out_filename):
+def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, cutoffs, tilts, eval_cutoff, out_filename, metrics=None):
     plt.rcParams.update({'font.size': 11, 'font.family': 'sans-serif'})
     
     # --- 共通データ準備 ---
@@ -472,18 +563,47 @@ def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, c
     _, P_deg = welch(deg_plot, sr, nperseg=N_PER_SEG)
     _, P_sh = welch(y_sh, sr, nperseg=N_PER_SEG)
     _, P_enh = welch(enh_plot, sr, nperseg=N_PER_SEG)
-    
+
+    # Regression line for PSD
+    valid_mask = (cutoffs > 1000) & ~np.isnan(cutoffs) & ~np.isnan(tilts)
+    if np.any(valid_mask):
+        median_fc = np.median(cutoffs[valid_mask])
+        median_tilt = np.median(tilts[valid_mask])
+        log10_fc = np.log10(max(median_fc, 200.0))
+        log10_2000 = np.log10(GAIN_CALC_LOW_CUT_HZ)
+        denom = log10_fc - log10_2000
+        reg_slope = median_tilt / denom if abs(denom) > 0.01 else 0.0
+
+        # Reference level from degraded PSD at cutoff
+        fc_idx = np.searchsorted(f, median_fc)
+        ref_level_db = 10 * np.log10(P_deg[min(fc_idx, len(P_deg)-1)] + 1e-12)
+
+        # Generate regression line points (from fc to sr/2)
+        reg_freqs = f[f >= median_fc]
+        reg_line_db = ref_level_db + reg_slope * (np.log10(np.maximum(reg_freqs, 1.0)) - log10_fc)
+
+        has_reg_line = True
+    else:
+        has_reg_line = False
+
     ax_e.plot(f, 10*np.log10(P_orig+1e-12), color='green', alpha=0.5, label='Original', linewidth=1.5)
     ax_e.plot(f, 10*np.log10(P_deg+1e-12), color='blue', alpha=0.7, label='Degraded/Input', linewidth=1.5)
     ax_e.plot(f, 10*np.log10(P_sh+1e-12), color='orange', linestyle='--', label='S&H Raw', linewidth=1.5, alpha=0.8)
     ax_e.plot(f, 10*np.log10(P_enh+1e-12), color='red', label='Restored', linewidth=2.0)
-    
+
+    if has_reg_line:
+        ax_e.plot(reg_freqs, reg_line_db, color='magenta', linewidth=2.0, linestyle='--',
+                  alpha=0.9, label=f'Regression Target (tilt={median_tilt:.1f}dB)')
+        ax_e.text(0.98, 0.02, f'Median fc={median_fc:.0f}Hz, tilt={median_tilt:.1f}dB, slope={reg_slope:.1f}dB/dec',
+                  transform=ax_e.transAxes, ha='right', va='bottom', fontsize=9,
+                  bbox=dict(facecolor='white', alpha=0.8, edgecolor='magenta'))
+
     ax_e.set_title('(e) Overall Power Spectral Density (PSD)', fontweight='bold')
     ax_e.set_xlabel('Frequency (Hz)')
     ax_e.set_ylabel('PSD (dB/Hz)')
     ax_e.set_xlim(0, 24000)
     ax_e.set_ylim(bottom=-110)
-    ax_e.legend(loc='lower left', ncol=4, fontsize=10)
+    ax_e.legend(loc='lower left', ncol=5, fontsize=10)
     ax_e.grid(True, which='both', alpha=0.3)
     save_individual_plot(fig_e, out_filename, "_plot_E_psd")
 
@@ -491,8 +611,12 @@ def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, c
     # =========================================
     # Part 2: 全体まとめプロット (16:9)
     # =========================================
-    fig_comb = plt.figure(figsize=(16, 9))
-    gs = fig_comb.add_gridspec(3, 2, height_ratios=[1, 1, 1], hspace=0.4, wspace=0.2)
+    has_metrics = metrics is not None
+    fig_h = 11 if has_metrics else 9
+    h_ratios = [1, 1, 1, 0.4] if has_metrics else [1, 1, 1]
+    n_rows = 4 if has_metrics else 3
+    fig_comb = plt.figure(figsize=(16, fig_h))
+    gs = fig_comb.add_gridspec(n_rows, 2, height_ratios=h_ratios, hspace=0.4, wspace=0.2)
 
     # (a)
     ax1 = fig_comb.add_subplot(gs[0, 0])
@@ -545,13 +669,41 @@ def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, c
     ax5.plot(f, 10*np.log10(P_deg+1e-12), color='blue', alpha=0.6, label='Degraded', linewidth=1.0)
     ax5.plot(f, 10*np.log10(P_sh+1e-12), color='orange', linestyle='--', label='S&H Raw', linewidth=1.0, alpha=0.7)
     ax5.plot(f, 10*np.log10(P_enh+1e-12), color='red', label='Restored', linewidth=1.5)
+
+    if has_reg_line:
+        ax5.plot(reg_freqs, reg_line_db, color='magenta', linewidth=2.0, linestyle='--',
+                 alpha=0.9, label=f'Regression Target (tilt={median_tilt:.1f}dB)')
+        ax5.text(0.98, 0.02, f'Median fc={median_fc:.0f}Hz, tilt={median_tilt:.1f}dB, slope={reg_slope:.1f}dB/dec',
+                 transform=ax5.transAxes, ha='right', va='bottom', fontsize=8,
+                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='magenta'))
+
     ax5.set_title('(e) Overall PSD', fontweight='bold')
     ax5.set_xlabel('Frequency (Hz)')
     ax5.set_ylabel('PSD (dB/Hz)')
     ax5.set_xlim(0, 24000)
     ax5.set_ylim(bottom=-100)
-    ax5.legend(loc='lower left', ncol=4, fontsize=9)
+    ax5.legend(loc='lower left', ncol=5, fontsize=9)
     ax5.grid(True, which='both', alpha=0.3)
+
+    # (f) Metrics Table
+    if has_metrics:
+        ax6 = fig_comb.add_subplot(gs[3, :])
+        ax6.axis('off')
+        ec = eval_cutoff if isinstance(eval_cutoff, (int, float)) else '?'
+        col_labels = ['Metric', 'Full-band', f'Band A\n(0-{ec}Hz)',
+                       f'Band B\n({ec}-20kHz)', 'Band C\n(20k-24kHz)']
+        table_data = [
+            ['MSE', f'{metrics["full_mse"]:.2e}', f'{metrics["band_a_mse"]:.2e}',
+             f'{metrics["band_b_mse"]:.2e}', f'{metrics["band_c_mse"]:.2e}'],
+            ['LSD (dB)', f'{metrics["lsd_full"]:.2f}', f'{metrics["lsd_band_a"]:.2f}',
+             f'{metrics["lsd_band_b"]:.2f}', f'{metrics["lsd_band_c"]:.2f}'],
+        ]
+        table = ax6.table(cellText=table_data, colLabels=col_labels,
+                         loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.0, 1.5)
+        ax6.set_title('(f) Evaluation Metrics', fontweight='bold', pad=10)
 
     save_individual_plot(fig_comb, out_filename, "_plot_Combined_Summary")
 
@@ -585,17 +737,23 @@ def process_single_pass(y_input, sr, eval_cutoff_freq=None):
     cutoffs_sample = f_cutoff(sample_indices).astype(np.float64)
     tilts_sample = f_tilt(sample_indices).astype(np.float64)
     
-    print(" -> Processing with Sample & Hold + Dual Shelf Filter...")
+    print(" -> Sample & Hold processing...")
     if num_channels == 1:
-        enhanced, sh_raw = apply_dynamic_processing(y_process.astype(np.float64), cutoffs_sample, tilts_sample, float(sr))
+        sh_raw = apply_sample_hold(y_process.astype(np.float64), cutoffs_sample, float(sr))
     else:
-        enhanced = np.zeros_like(y_process)
         sh_raw = np.zeros_like(y_process)
         for ch in range(num_channels):
-            e_ch, sh_ch = apply_dynamic_processing(y_process[:, ch].astype(np.float64), cutoffs_sample, tilts_sample, float(sr))
-            enhanced[:, ch] = e_ch
-            sh_raw[:, ch] = sh_ch
-            
+            sh_raw[:, ch] = apply_sample_hold(y_process[:, ch].astype(np.float64), cutoffs_sample, float(sr))
+
+    print(" -> Multiband AGC shaping...")
+    if num_channels == 1:
+        enhanced = apply_multiband_agc(sh_raw, y_ana, sr, detected_cutoffs, calculated_tilts)
+    else:
+        enhanced = np.zeros_like(y_process)
+        for ch in range(num_channels):
+            deg_ch = y_process[:, ch] if y_process.ndim > 1 else y_process
+            enhanced[:, ch] = apply_multiband_agc(sh_raw[:, ch], deg_ch, sr, detected_cutoffs, calculated_tilts)
+
     return degraded_signal, sh_raw, enhanced, times, detected_cutoffs, calculated_tilts
 
 # ==========================================
@@ -650,9 +808,21 @@ def main():
             print(f"MSE (Original vs S&H Raw):   {mse_sh:.6e}")
             print(f"MSE (Original vs Enhanced):  {mse_enh:.6e}")
 
+            print(" -> Computing detailed metrics...")
+            metrics = compute_all_metrics(y, enh_y, sr, cutoff)
+            print(f"\n  [Band-specific MSE]")
+            print(f"    Band A (0-{cutoff}Hz):       {metrics['band_a_mse']:.6e}")
+            print(f"    Band B ({cutoff}-20kHz):      {metrics['band_b_mse']:.6e}")
+            print(f"    Band C (20k-24kHz):           {metrics['band_c_mse']:.6e}")
+            print(f"  [Log-Spectral Distance]")
+            print(f"    Full-band LSD:                {metrics['lsd_full']:.2f} dB")
+            print(f"    Band A LSD:                   {metrics['lsd_band_a']:.2f} dB")
+            print(f"    Band B LSD:                   {metrics['lsd_band_b']:.2f} dB")
+            print(f"    Band C LSD:                   {metrics['lsd_band_c']:.2f} dB")
+
             if not args.no_plot:
                 print("Generating plots (Memory Safe Mode)...")
-                plot_paper_evaluation(y, deg_y, sh_y, enh_y, sr, times, d_cutoffs, d_tilts, cutoff, out_enh)
+                plot_paper_evaluation(y, deg_y, sh_y, enh_y, sr, times, d_cutoffs, d_tilts, cutoff, out_enh, metrics=metrics)
 
     else:
         print("=== NORMAL PROCESSING MODE ===")
@@ -667,9 +837,23 @@ def main():
         print(f"MSE (Original vs S&H Raw):   {mse_sh:.6e}")
         print(f"MSE (Original vs Enhanced):  {mse_enh:.6e}")
 
+        valid_cutoffs = d_cutoffs[d_cutoffs > SILENCE_THRESHOLD_HZ]
+        representative_cutoff = float(np.median(valid_cutoffs)) if len(valid_cutoffs) > 0 else 5000.0
+        print(f" -> Computing detailed metrics (estimated cutoff: {representative_cutoff:.0f}Hz)...")
+        metrics = compute_all_metrics(y, enh_y, sr, representative_cutoff)
+        print(f"\n  [Band-specific MSE]")
+        print(f"    Band A (0-{representative_cutoff:.0f}Hz):  {metrics['band_a_mse']:.6e}")
+        print(f"    Band B ({representative_cutoff:.0f}-20kHz): {metrics['band_b_mse']:.6e}")
+        print(f"    Band C (20k-24kHz):           {metrics['band_c_mse']:.6e}")
+        print(f"  [Log-Spectral Distance]")
+        print(f"    Full-band LSD:                {metrics['lsd_full']:.2f} dB")
+        print(f"    Band A LSD:                   {metrics['lsd_band_a']:.2f} dB")
+        print(f"    Band B LSD:                   {metrics['lsd_band_b']:.2f} dB")
+        print(f"    Band C LSD:                   {metrics['lsd_band_c']:.2f} dB")
+
         if not args.no_plot:
             print("Generating plots (Memory Safe Mode)...")
-            plot_paper_evaluation(y, y, sh_y, enh_y, sr, times, d_cutoffs, d_tilts, "None (Native)", out_name)
+            plot_paper_evaluation(y, y, sh_y, enh_y, sr, times, d_cutoffs, d_tilts, "None (Native)", out_name, metrics=metrics)
 
 if __name__ == '__main__':
     main()
