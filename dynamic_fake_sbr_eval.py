@@ -49,11 +49,14 @@ GAIN_CALC_LOW_CUT_HZ = 2000
 MAX_GAIN_LIMIT_DB = 6.0
 
 # ★マルチバンドAGCパラメータ
-AGC_N_BANDS = 3
+AGC_N_BANDS = 8
 AGC_GAIN_SMOOTH_ALPHA = 0.3      # ゲイン平滑化係数 (0=変化なし, 1=即追従)
 AGC_MAX_GAIN_DB = 6.0             # 最大ブースト
 AGC_MIN_GAIN_DB = -20.0           # 最大カット
 AGC_REFERENCE_BAND_RATIO = 0.7    # カットオフ直下の参照バンド幅比率
+AGC_SLOPE_MAX_DB_PER_DEC = -3.0   # slopeの上限 (正の傾きを禁止、最低でも-3dB/decの減衰)
+AGC_SLOPE_MIN_DB_PER_DEC = -40.0  # slopeの下限 (急すぎる減衰を防止)
+AGC_CONFIDENCE_DECAY_RATE = 1.5   # 信頼度減衰レート (大きいほど遠い周波数でAGCが弱くなる)
 
 # ★ S&Hオーバーサンプリング係数 (2.0→2.5: ナイキストヌルを臨界帯域外にシフト)
 SH_OVERSAMPLE_FACTOR = 2.5
@@ -82,7 +85,8 @@ def apply_sample_hold(audio, cutoffs_per_sample, sr):
         sh_output[i] = hold_val
     return sh_output
 
-def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts_per_frame):
+def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts_per_frame,
+                         n_bands=None, slope_clamp=True, confidence_decay=True):
     """STFT領域マルチバンドAGC: S&H出力を回帰予測ターゲットに合わせてゲイン制御"""
     n_fft = 2048
     hop = 512
@@ -101,9 +105,10 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
     eps = 1e-10
     log10_2000 = np.log10(GAIN_CALC_LOW_CUT_HZ)
 
-    # バンド境界（カットオフ〜ナイキスト間を3等分）
+    # バンド境界（カットオフ〜ナイキスト間を分割）
+    actual_n_bands = n_bands if n_bands is not None else AGC_N_BANDS
     mag_out = mag_sh.copy()
-    prev_gains = np.zeros(AGC_N_BANDS)
+    prev_gains = np.zeros(actual_n_bands)
 
     for frame_idx in range(n_frames):
         fc = cutoffs_per_frame[min(frame_idx, len(cutoffs_per_frame)-1)]
@@ -116,6 +121,9 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
         log10_fc = np.log10(max(fc, 200.0))
         denom = log10_fc - log10_2000
         slope = tilt / denom if abs(denom) > 0.01 else 0.0
+        # A: slopeクランプ — 物理的にありえる範囲に制限
+        if slope_clamp:
+            slope = np.clip(slope, AGC_SLOPE_MIN_DB_PER_DEC, AGC_SLOPE_MAX_DB_PER_DEC)
 
         # 参照レベル: カットオフ直下のパスバンドエネルギー
         ref_low_idx = np.searchsorted(freqs, fc * AGC_REFERENCE_BAND_RATIO)
@@ -129,11 +137,11 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
         band_range = n_bins - cutoff_bin
         if band_range < 3:
             continue
-        band_size = band_range // AGC_N_BANDS
+        band_size = band_range // actual_n_bands
 
-        for b in range(AGC_N_BANDS):
+        for b in range(actual_n_bands):
             b_start = cutoff_bin + b * band_size
-            b_end = cutoff_bin + (b + 1) * band_size if b < AGC_N_BANDS - 1 else n_bins
+            b_end = cutoff_bin + (b + 1) * band_size if b < actual_n_bands - 1 else n_bins
             if b_start >= b_end:
                 continue
 
@@ -146,11 +154,18 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
             # ターゲットレベル = 参照レベル + 回帰外挿
             target_db = ref_mag_db + slope * (np.log10(f_center) - log10_fc)
 
+            # B: 信頼度減衰 — fcから離れるほどAGCゲインを減衰
+            if confidence_decay:
+                dist_decades = np.log10(f_center) - log10_fc  # fcからの距離(decade)
+                confidence = np.exp(-AGC_CONFIDENCE_DECAY_RATE * dist_decades)
+            else:
+                confidence = 1.0
+
             # 実測レベル
             actual_db = np.mean(20.0 * np.log10(mag_sh[b_start:b_end, frame_idx] + eps))
 
-            # ゲイン計算
-            gain_db = target_db - actual_db
+            # ゲイン計算 (信頼度で減衰)
+            gain_db = (target_db - actual_db) * confidence
             gain_db = np.clip(gain_db, AGC_MIN_GAIN_DB, AGC_MAX_GAIN_DB)
 
             # 時間平滑化
@@ -573,6 +588,7 @@ def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, c
         log10_2000 = np.log10(GAIN_CALC_LOW_CUT_HZ)
         denom = log10_fc - log10_2000
         reg_slope = median_tilt / denom if abs(denom) > 0.01 else 0.0
+        reg_slope = np.clip(reg_slope, AGC_SLOPE_MIN_DB_PER_DEC, AGC_SLOPE_MAX_DB_PER_DEC)
 
         # Reference level from degraded PSD at cutoff
         fc_idx = np.searchsorted(f, median_fc)
@@ -711,7 +727,7 @@ def plot_paper_evaluation(original_y, degraded_y, sh_y, enhanced_y, sr, times, c
 # 処理パイプライン
 # ==========================================
 
-def process_single_pass(y_input, sr, eval_cutoff_freq=None):
+def process_single_pass(y_input, sr, eval_cutoff_freq=None, baseline=False):
     if eval_cutoff_freq is not None:
         print(f"\n[Eval Mode] Applying Low-pass filter at {eval_cutoff_freq} Hz...")
         y_process = apply_lowpass_filter(y_input, sr, eval_cutoff_freq)
@@ -747,12 +763,20 @@ def process_single_pass(y_input, sr, eval_cutoff_freq=None):
 
     print(" -> Multiband AGC shaping...")
     if num_channels == 1:
-        enhanced = apply_multiband_agc(sh_raw, y_ana, sr, detected_cutoffs, calculated_tilts)
+        if baseline:
+            enhanced = apply_multiband_agc(sh_raw, y_ana, sr, detected_cutoffs, calculated_tilts,
+                                            n_bands=3, slope_clamp=False, confidence_decay=False)
+        else:
+            enhanced = apply_multiband_agc(sh_raw, y_ana, sr, detected_cutoffs, calculated_tilts)
     else:
         enhanced = np.zeros_like(y_process)
         for ch in range(num_channels):
             deg_ch = y_process[:, ch] if y_process.ndim > 1 else y_process
-            enhanced[:, ch] = apply_multiband_agc(sh_raw[:, ch], deg_ch, sr, detected_cutoffs, calculated_tilts)
+            if baseline:
+                enhanced[:, ch] = apply_multiband_agc(sh_raw[:, ch], deg_ch, sr, detected_cutoffs, calculated_tilts,
+                                                       n_bands=3, slope_clamp=False, confidence_decay=False)
+            else:
+                enhanced[:, ch] = apply_multiband_agc(sh_raw[:, ch], deg_ch, sr, detected_cutoffs, calculated_tilts)
 
     return degraded_signal, sh_raw, enhanced, times, detected_cutoffs, calculated_tilts
 
@@ -766,7 +790,8 @@ def main():
     parser.add_argument('--eval', action='store_true', help='Enable evaluation mode')
     parser.add_argument('--eval_lowpass', type=int, default=None, help='Specific cutoff freq')
     parser.add_argument('--no-plot', action='store_true', help='Disable plotting')
-    
+    parser.add_argument('--baseline', action='store_true', help='Also run baseline (no improvements) for comparison')
+
     args = parser.parse_args()
 
     try:
@@ -819,6 +844,29 @@ def main():
             print(f"    Band A LSD:                   {metrics['lsd_band_a']:.2f} dB")
             print(f"    Band B LSD:                   {metrics['lsd_band_b']:.2f} dB")
             print(f"    Band C LSD:                   {metrics['lsd_band_c']:.2f} dB")
+
+            if args.baseline:
+                print("\n--- Baseline (no improvements) ---")
+                _, _, enh_baseline, _, _, _ = process_single_pass(y, sr, eval_cutoff_freq=cutoff, baseline=True)
+                metrics_baseline = compute_all_metrics(y, enh_baseline, sr, cutoff)
+
+                print(f"\n  === Before/After Comparison ===")
+                print(f"  {'Metric':<25} {'Baseline':>12} {'Improved':>12} {'Change':>10}")
+                print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*10}")
+
+                for key, label in [('band_b_mse', 'Band B MSE'), ('full_mse', 'Full MSE'),
+                                    ('lsd_band_b', 'Band B LSD (dB)'), ('lsd_full', 'Full LSD (dB)')]:
+                    v_base = metrics_baseline[key]
+                    v_imp = metrics[key]
+                    if v_base != 0:
+                        change_pct = (v_imp - v_base) / abs(v_base) * 100
+                    else:
+                        change_pct = 0.0
+
+                    if key.endswith('mse'):
+                        print(f"  {label:<25} {v_base:>12.4e} {v_imp:>12.4e} {change_pct:>+9.1f}%")
+                    else:
+                        print(f"  {label:<25} {v_base:>12.2f} {v_imp:>12.2f} {change_pct:>+9.1f}%")
 
             if not args.no_plot:
                 print("Generating plots (Memory Safe Mode)...")
