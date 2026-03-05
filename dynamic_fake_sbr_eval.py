@@ -155,9 +155,11 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
             target_db = ref_mag_db + slope * (np.log10(f_center) - log10_fc)
 
             # B: 信頼度減衰 — fcから離れるほどAGCゲインを減衰
+            #    カットオフが低いほど減衰率を緩和（5kHz基準でスケーリング）
             if confidence_decay:
                 dist_decades = np.log10(f_center) - log10_fc  # fcからの距離(decade)
-                confidence = np.exp(-AGC_CONFIDENCE_DECAY_RATE * dist_decades)
+                adaptive_decay = AGC_CONFIDENCE_DECAY_RATE * min(fc / 5000.0, 1.0)
+                confidence = np.exp(-adaptive_decay * dist_decades)
             else:
                 confidence = 1.0
 
