@@ -793,8 +793,10 @@ def main():
     parser.add_argument('--eval_lowpass', type=int, default=None, help='Specific cutoff freq')
     parser.add_argument('--no-plot', action='store_true', help='Disable plotting')
     parser.add_argument('--baseline', action='store_true', help='Also run baseline (no improvements) for comparison')
+    parser.add_argument('--outdir', default='.', help='出力ディレクトリ')
 
     args = parser.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
     try:
         y, sr = librosa.load(args.input, sr=ORIGINAL_SR, mono=False)
@@ -803,7 +805,7 @@ def main():
         print(f"Error loading file: {e}")
         return
 
-    base_name = os.path.splitext(os.path.basename(args.input))[0]
+    base_name = os.path.join(args.outdir, os.path.splitext(os.path.basename(args.input))[0])
 
     if args.eval:
         print("=== EVALUATION MODE STARTED ===")
