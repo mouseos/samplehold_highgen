@@ -25,8 +25,9 @@ HOP_LENGTH = 512
 # カットオフ検出パラメータ
 PASSBAND_START_HZ = 500         
 PASSBAND_END_HZ = 1500          
-DROP_THRESHOLD_DB = 11.0        
-ABSOLUTE_SILENCE_DB = -70.0    
+DROP_THRESHOLD_DB = 7.0
+ABSOLUTE_SILENCE_DB = -55.0
+LOW_ENERGY_THRESHOLD_DB = -45.0  # パスバンドエネルギーが低いフレームをNaN扱い
 
 # ★スライド「手法③」固有パラメータ
 ENERGY_PERCENTILE = 0.9999   # 累積エネルギー99.99%地点
@@ -36,10 +37,10 @@ SCAN_RANGE_HZ = 4000         # 前後探索範囲
 DETECTION_LOW_CUT_HZ = 1000  
 
 # --- 平滑化パラメータ ---
-SPIKE_REJECTION_FILTER_SIZE = 31
+SPIKE_REJECTION_FILTER_SIZE = 51
 HYSTERESIS_THRESHOLD_HZ = 1200
-SUSTAIN_FRAMES = 60
-ATTACK_COEFF = 0.15
+SUSTAIN_FRAMES = 150
+ATTACK_COEFF = 0.08
 RELEASE_COEFF = 0.005
 SILENCE_THRESHOLD_HZ = 1000
 
@@ -288,7 +289,7 @@ def apply_hysteresis_smoothing(cutoffs_despiked, attack_coeff, release_coeff):
     smoothed_cutoffs[0] = representative_val
     trend = 0
     trend_sustain_count = 0
-    CLAMP_FRAMES = 5 
+    CLAMP_FRAMES = 40
     for i in range(1, len(cutoffs_despiked)):
         if i < CLAMP_FRAMES:
             smoothed_cutoffs[i] = representative_val
@@ -309,6 +310,10 @@ def apply_hysteresis_smoothing(cutoffs_despiked, attack_coeff, release_coeff):
             continue
         coeff = attack_coeff if trend == 1 else release_coeff
         smoothed_cutoffs[i] = previous_smoothed * (1 - coeff) + current_raw * coeff
+        MAX_SLEW_HZ_PER_FRAME = 50
+        delta = smoothed_cutoffs[i] - smoothed_cutoffs[i-1]
+        if abs(delta) > MAX_SLEW_HZ_PER_FRAME:
+            smoothed_cutoffs[i] = smoothed_cutoffs[i-1] + np.sign(delta) * MAX_SLEW_HZ_PER_FRAME
     return smoothed_cutoffs
 
 def detect_cutoff_and_slope(y, sr):
@@ -339,7 +344,14 @@ def detect_cutoff_and_slope(y, sr):
             cutoff_frequencies.append(np.nan)
             tilt_values.append(np.nan)
             continue
-        
+
+        # New: low energy gating
+        passband_level = np.mean(frame_db[passband_start_idx:passband_end_idx])
+        if passband_level < LOW_ENERGY_THRESHOLD_DB:
+            cutoff_frequencies.append(np.nan)
+            tilt_values.append(np.nan)
+            continue
+
         # 累積エネルギー計算（低域マスク）
         calc_energy = frame_energy.copy()
         calc_energy[:det_low_cut_idx] = 0.0 
@@ -352,8 +364,17 @@ def detect_cutoff_and_slope(y, sr):
         cumulative_energy = np.cumsum(calc_energy)
         threshold_energy = total_energy_filtered * ENERGY_PERCENTILE
         provisional_idx = np.searchsorted(cumulative_energy, threshold_energy)
-        
+
         ref_level_db = np.mean(frame_db[passband_start_idx:passband_end_idx])
+        # Local reference: measure level at 0.5-0.7x of provisional cutoff frequency
+        provisional_freq = fft_freqs[provisional_idx] if provisional_idx < len(fft_freqs) else fft_freqs[-1]
+        local_ref_low = max(provisional_freq * 0.5, 500.0)
+        local_ref_high = provisional_freq * 0.7
+        local_ref_low_idx = np.searchsorted(fft_freqs, local_ref_low)
+        local_ref_high_idx = np.searchsorted(fft_freqs, local_ref_high)
+        if local_ref_high_idx > local_ref_low_idx + 1:
+            ref_level_db = np.mean(frame_db[local_ref_low_idx:local_ref_high_idx])
+        # else keep the original passband ref_level_db as fallback
         drop_target_db = ref_level_db - DROP_THRESHOLD_DB
         
         detected_cutoff_freq = np.nan
@@ -390,14 +411,29 @@ def detect_cutoff_and_slope(y, sr):
     def fill_nan(arr):
         mask = np.isnan(arr)
         if not np.any(mask): return arr
+        valid_indices = np.where(~mask)[0]
+        if len(valid_indices) == 0:
+            return np.full_like(arr, 5000.0)
+
+        # Forward fill interior NaN
         idx = np.where(~mask, np.arange(mask.shape[0]), 0)
         np.maximum.accumulate(idx, out=idx)
         out = arr[idx]
-        if np.isnan(out[0]):
-            if np.all(np.isnan(out)): return np.full_like(out, 5000.0) 
-            first_valid_idx = np.where(~np.isnan(out))[0][0]
-            first_valid_val = out[first_valid_idx]
-            out[:first_valid_idx] = first_valid_val
+
+        # Leading edge: use median of first 50 valid values
+        first_valid_idx = valid_indices[0]
+        if first_valid_idx > 0:
+            n_edge = min(50, len(valid_indices))
+            left_fill_val = np.median(arr[valid_indices[:n_edge]])
+            out[:first_valid_idx] = left_fill_val
+
+        # Trailing edge: use median of last 50 valid values
+        last_valid_idx = valid_indices[-1]
+        if last_valid_idx < len(arr) - 1:
+            n_edge = min(50, len(valid_indices))
+            right_fill_val = np.median(arr[valid_indices[-n_edge:]])
+            out[last_valid_idx + 1:] = right_fill_val
+
         return out
     
     cutoffs_np = fill_nan(np.array(cutoff_frequencies))
