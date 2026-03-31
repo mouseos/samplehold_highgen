@@ -50,7 +50,7 @@ MAX_GAIN_LIMIT_DB = 6.0
 
 # ★マルチバンドAGCパラメータ
 AGC_N_BANDS = 8
-AGC_GAIN_SMOOTH_ALPHA = 0.3      # ゲイン平滑化係数 (0=変化なし, 1=即追従)
+AGC_GAIN_SMOOTH_ALPHA = 0.15  # ゲイン平滑化係数（安定性重視）
 AGC_MAX_GAIN_DB = 6.0             # 最大ブースト
 AGC_MIN_GAIN_DB = -20.0           # 最大カット
 AGC_REFERENCE_BAND_RATIO = 0.7    # カットオフ直下の参照バンド幅比率
@@ -153,6 +153,7 @@ def apply_multiband_agc(sh_signal, degraded_signal, sr, cutoffs_per_frame, tilts
 
             # ターゲットレベル = 参照レベル + 回帰外挿
             target_db = ref_mag_db + slope * (np.log10(f_center) - log10_fc)
+            target_db = min(target_db, ref_mag_db + 3.0)
 
             # B: 信頼度減衰 — fcから離れるほどAGCゲインを減衰
             #    カットオフが低いほど減衰率を緩和（5kHz基準でスケーリング）
